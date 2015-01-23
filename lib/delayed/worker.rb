@@ -19,7 +19,8 @@ module Delayed
 
     cattr_accessor :min_priority, :max_priority, :max_attempts, :max_run_time,
                    :default_priority, :sleep_delay, :logger, :delay_jobs, :queues,
-                   :read_ahead, :plugins, :destroy_failed_jobs, :exit_on_complete
+                   :read_ahead, :plugins, :destroy_failed_jobs, :exit_on_complete,
+                   :default_log_level
 
     # Named queue into which jobs are enqueued by default
     cattr_accessor :default_queue_name
@@ -30,13 +31,14 @@ module Delayed
     attr_accessor :name_prefix
 
     def self.reset
-      self.sleep_delay      = DEFAULT_SLEEP_DELAY
-      self.max_attempts     = DEFAULT_MAX_ATTEMPTS
-      self.max_run_time     = DEFAULT_MAX_RUN_TIME
-      self.default_priority = DEFAULT_DEFAULT_PRIORITY
-      self.delay_jobs       = DEFAULT_DELAY_JOBS
-      self.queues           = DEFAULT_QUEUES
-      self.read_ahead       = DEFAULT_READ_AHEAD
+      self.default_log_level = DEFAULT_LOG_LEVEL
+      self.sleep_delay       = DEFAULT_SLEEP_DELAY
+      self.max_attempts      = DEFAULT_MAX_ATTEMPTS
+      self.max_run_time      = DEFAULT_MAX_RUN_TIME
+      self.default_priority  = DEFAULT_DEFAULT_PRIORITY
+      self.delay_jobs        = DEFAULT_DELAY_JOBS
+      self.queues            = DEFAULT_QUEUES
+      self.read_ahead        = DEFAULT_READ_AHEAD
     end
 
     reset
@@ -56,12 +58,6 @@ module Delayed
     # true - Will raise an exception on TERM and INT
     cattr_accessor :raise_signal_exceptions
     self.raise_signal_exceptions = false
-
-    self.logger = if defined?(Rails)
-      Rails.logger
-    elsif defined?(RAILS_DEFAULT_LOGGER)
-      RAILS_DEFAULT_LOGGER
-    end
 
     def self.backend=(backend)
       if backend.is_a? Symbol
@@ -104,6 +100,10 @@ module Delayed
       @lifecycle ||= Delayed::Lifecycle.new
     end
 
+    def self.reload_app?
+      defined?(ActionDispatch::Reloader) && Rails.application.config.cache_classes == false
+    end
+
     def initialize(options = {})
       @quiet = options.key?(:quiet) ? options[:quiet] : true
       @failed_reserve_count = 0
@@ -130,13 +130,13 @@ module Delayed
 
     def start # rubocop:disable CyclomaticComplexity, PerceivedComplexity
       trap('TERM') do
-        say 'Exiting...'
+        Thread.new { say 'Exiting...' }
         stop
         raise SignalException, 'TERM' if self.class.raise_signal_exceptions
       end
 
       trap('INT') do
-        say 'Exiting...'
+        Thread.new { say 'Exiting...' }
         stop
         raise SignalException, 'INT' if self.class.raise_signal_exceptions && self.class.raise_signal_exceptions != :term
       end
@@ -159,6 +159,7 @@ module Delayed
               break
             elsif !stop?
               sleep(self.class.sleep_delay)
+              reload!
             end
           else
             say format("#{count} jobs processed at %.4f j/s, %d failed", count / @realtime, @result.last)
@@ -200,7 +201,7 @@ module Delayed
     def run(job)
       job_say job, 'RUNNING'
       runtime =  Benchmark.realtime do
-        Timeout.timeout(self.class.max_run_time.to_i, WorkerTimeout) { job.invoke_job }
+        Timeout.timeout(max_run_time(job).to_i, WorkerTimeout) { job.invoke_job }
         job.destroy
       end
       job_say job, format('COMPLETED after %.4f', runtime)
@@ -240,12 +241,12 @@ module Delayed
       end
     end
 
-    def job_say(job, text, level = DEFAULT_LOG_LEVEL)
+    def job_say(job, text, level = default_log_level)
       text = "Job #{job.name} (id=#{job.id}) #{text}"
       say text, level
     end
 
-    def say(text, level = DEFAULT_LOG_LEVEL)
+    def say(text, level = default_log_level)
       text = "[Worker(#{name})] #{text}"
       puts text unless @quiet
       return unless logger
@@ -258,6 +259,10 @@ module Delayed
 
     def max_attempts(job)
       job.max_attempts || self.class.max_attempts
+    end
+
+    def max_run_time(job)
+      job.max_run_time || self.class.max_run_time
     end
 
   protected
@@ -285,6 +290,12 @@ module Delayed
       @failed_reserve_count += 1
       raise FatalBackendError if @failed_reserve_count >= 10
       nil
+    end
+
+    def reload!
+      return unless self.class.reload_app?
+      ActionDispatch::Reloader.cleanup!
+      ActionDispatch::Reloader.prepare!
     end
   end
 end

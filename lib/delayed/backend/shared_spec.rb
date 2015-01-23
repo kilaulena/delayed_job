@@ -14,6 +14,7 @@ shared_examples_for 'a delayed_job backend' do
     Delayed::Worker.min_priority = nil
     Delayed::Worker.default_priority = 99
     Delayed::Worker.delay_jobs = true
+    Delayed::Worker.default_queue_name = 'default_tracking'
     SimpleJob.runs = 0
     described_class.delete_all
   end
@@ -62,8 +63,18 @@ shared_examples_for 'a delayed_job backend' do
       end
 
       it 'is able to set queue' do
-        job = described_class.enqueue :payload_object => SimpleJob.new, :queue => 'tracking'
+        job = described_class.enqueue :payload_object => NamedQueueJob.new, :queue => 'tracking'
         expect(job.queue).to eq('tracking')
+      end
+
+      it 'uses default queue' do
+        job = described_class.enqueue :payload_object => SimpleJob.new
+        expect(job.queue).to eq(Delayed::Worker.default_queue_name)
+      end
+
+      it "uses the payload object's queue" do
+        job = described_class.enqueue :payload_object => NamedQueueJob.new
+        expect(job.queue).to eq(NamedQueueJob.new.queue_name)
       end
     end
 
@@ -175,8 +186,16 @@ shared_examples_for 'a delayed_job backend' do
 
     it 'raises a DeserializationError when the YAML.load raises argument error' do
       job = described_class.new :handler => '--- !ruby/struct:GoingToRaiseArgError {}'
-      expect(YAML).to receive(:load).and_raise(ArgumentError)
+      expect(YAML).to receive(:load_dj).and_raise(ArgumentError)
       expect { job.payload_object }.to raise_error(Delayed::DeserializationError)
+    end
+
+    it 'raises a DeserializationError when the YAML.load raises syntax error' do
+      # only test with Psych since the other YAML parsers don't raise a SyntaxError
+      if YAML.parser.class.name !~ /syck|yecht/i
+        job = described_class.new :handler => 'message: "no ending quote'
+        expect { job.payload_object }.to raise_error(Delayed::DeserializationError)
+      end
     end
   end
 
@@ -398,9 +417,36 @@ shared_examples_for 'a delayed_job backend' do
       expect(@job.max_attempts).to be_nil
     end
 
-    it 'uses the max_retries value on the payload when defined' do
+    it 'uses the max_attempts value on the payload when defined' do
       expect(@job.payload_object).to receive(:max_attempts).and_return(99)
       expect(@job.max_attempts).to eq(99)
+    end
+  end
+
+  describe '#max_run_time' do
+    before(:each) { @job = described_class.enqueue SimpleJob.new }
+
+    it 'is not defined' do
+      expect(@job.max_run_time).to be_nil
+    end
+
+    it 'results in a default run time when not defined' do
+      expect(worker.max_run_time(@job)).to eq(Delayed::Worker::DEFAULT_MAX_RUN_TIME)
+    end
+
+    it 'uses the max_run_time value on the payload when defined' do
+      expect(@job.payload_object).to receive(:max_run_time).and_return(30.minutes)
+      expect(@job.max_run_time).to eq(30.minutes)
+    end
+
+    it 'results in an overridden run time when defined' do
+      expect(@job.payload_object).to receive(:max_run_time).and_return(45.minutes)
+      expect(worker.max_run_time(@job)).to eq(45.minutes)
+    end
+
+    it 'job set max_run_time can not exceed default max run time' do
+      expect(@job.payload_object).to receive(:max_run_time).and_return(Delayed::Worker::DEFAULT_MAX_RUN_TIME + 60)
+      expect(worker.max_run_time(@job)).to eq(Delayed::Worker::DEFAULT_MAX_RUN_TIME)
     end
   end
 
@@ -409,14 +455,20 @@ shared_examples_for 'a delayed_job backend' do
       it 'raises error ArgumentError for new records' do
         story = Story.new(:text => 'hello')
         if story.respond_to?(:new_record?)
-          expect { story.delay.tell }.to raise_error(ArgumentError, 'Jobs cannot be created for non-persisted records')
+          expect { story.delay.tell }.to raise_error(
+            ArgumentError,
+            "job cannot be created for non-persisted record: #{story.inspect}"
+          )
         end
       end
 
       it 'raises error ArgumentError for destroyed records' do
         story = Story.create(:text => 'hello')
         story.destroy
-        expect { story.delay.tell }.to raise_error(ArgumentError, 'Jobs cannot be created for non-persisted records')
+        expect { story.delay.tell }.to raise_error(
+          ArgumentError,
+          "job cannot be created for non-persisted record: #{story.inspect}"
+        )
       end
     end
 

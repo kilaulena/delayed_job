@@ -7,13 +7,17 @@ module Delayed
 
       module ClassMethods
         # Add a job to the queue
-        def enqueue(*args)
-          options = {
-            :priority => Delayed::Worker.default_priority,
-            :queue => Delayed::Worker.default_queue_name
-          }.merge!(args.extract_options!)
-
+        def enqueue(*args) # rubocop:disable CyclomaticComplexity
+          options = args.extract_options!
           options[:payload_object] ||= args.shift
+          options[:priority]       ||= Delayed::Worker.default_priority
+
+          if options[:queue].nil?
+            if options[:payload_object].respond_to?(:queue_name)
+              options[:queue] = options[:payload_object].queue_name
+            end
+            options[:queue] ||= Delayed::Worker.default_queue_name
+          end
 
           if args.size > 0
             warn '[DEPRECATION] Passing multiple arguments to `#enqueue` is deprecated. Pass a hash with :priority and :run_at.'
@@ -85,14 +89,8 @@ module Delayed
       end
 
       def payload_object
-        if YAML.respond_to?(:unsafe_load)
-          # See https://github.com/dtao/safe_yaml
-          # When the method is there, we need to load our YAML like this...
-          @payload_object ||= YAML.load(handler, :safe => false)
-        else
-          @payload_object ||= YAML.load(handler)
-        end
-      rescue TypeError, LoadError, NameError, ArgumentError => e
+        @payload_object ||= YAML.load_dj(handler)
+      rescue TypeError, LoadError, NameError, ArgumentError, SyntaxError, Psych::SyntaxError => e
         raise DeserializationError, "Job failed to load: #{e.message}. Handler: #{handler.inspect}"
       end
 
@@ -102,7 +100,7 @@ module Delayed
             hook :before
             payload_object.perform
             hook :success
-          rescue => e
+          rescue Exception => e # rubocop:disable RescueException
             hook :error, e
             raise e
           ensure
@@ -135,6 +133,17 @@ module Delayed
 
       def max_attempts
         payload_object.max_attempts if payload_object.respond_to?(:max_attempts)
+      end
+
+      def max_run_time
+        return unless payload_object.respond_to?(:max_run_time)
+        return unless (run_time = payload_object.max_run_time)
+
+        if run_time > Delayed::Worker.max_run_time
+          Delayed::Worker.max_run_time
+        else
+          run_time
+        end
       end
 
       def fail!

@@ -58,6 +58,23 @@ running the following command:
     rails generate delayed_job:active_record
     rake db:migrate
 
+For Rails 4.2, see [below](#rails-42)
+
+Development
+===========
+In development mode, if you are using Rails 3.1+, your application code will automatically reload every 100 jobs or when the queue finishes.
+You no longer need to restart Delayed Job every time you update your code in development.
+
+Rails 4.2
+=========
+Set the queue_adapter in config/application.rb
+
+```ruby
+config.active_job.queue_adapter = :delayed_job
+```
+
+See the [rails guide](http://guides.rubyonrails.org/active_job_basics.html#setting-the-backend) for more details.
+
 Rails 4
 =======
 If you are using the protected_attributes gem, it must appear before delayed_job in your gemfile.
@@ -119,10 +136,12 @@ class LongTasks
     2.hours.from_now
   end
 
-  def call_a_class_method
-    # Some other code
+  class << self
+    def call_a_class_method
+      # Some other code
+    end
+    handle_asynchronously :call_a_class_method, :run_at => Proc.new { when_to_run }
   end
-  handle_asynchronously :call_a_class_method, :run_at => Proc.new { when_to_run }
 
   attr_reader :how_important
 
@@ -242,9 +261,11 @@ NewsletterJob = Struct.new(:text, :emails) do
   end
 end
 
-Delayed::Job.enqueue NewsletterJob.new('lorem ipsum...', Customers.find(:all).collect(&:email))
+Delayed::Job.enqueue NewsletterJob.new('lorem ipsum...', Customers.pluck(:email))
 ```
+
 To set a per-job max attempts that overrides the Delayed::Worker.max_attempts you can define a max_attempts method on the job
+
 ```ruby
 NewsletterJob = Struct.new(:text, :emails) do
   def perform
@@ -252,11 +273,54 @@ NewsletterJob = Struct.new(:text, :emails) do
   end
 
   def max_attempts
-    return 3
+    3
   end
 end
-````
+```
 
+To set a per-job max run time that overrides the Delayed::Worker.max_run_time you can define a max_run_time method on the job
+
+NOTE: this can ONLY be used to set a max_run_time that is lower than Delayed::Worker.max_run_time. Otherwise the lock on the job would expire and another worker would start the working on the in progress job.
+
+```ruby
+NewsletterJob = Struct.new(:text, :emails) do
+  def perform
+    emails.each { |e| NewsletterMailer.deliver_text_to_email(text, e) }
+  end
+
+  def max_run_time
+    120 # seconds
+  end
+end
+```
+
+To set a default queue name for a custom job that overrides Delayed::Worker.default_queue_name, you can define a queue_name method on the job
+
+```ruby
+NewsletterJob = Struct.new(:text, :emails) do
+  def perform
+    emails.each { |e| NewsletterMailer.deliver_text_to_email(text, e) }
+  end
+
+  def queue_name
+    'newsletter_queue'
+  end
+end
+```
+
+On error, the job is scheduled again in 5 seconds + N ** 4, where N is the number of attempts. You can define your own `reschedule_at` method to override this default behavior.
+
+```ruby
+NewsletterJob = Struct.new(:text, :emails) do
+  def perform
+    emails.each { |e| NewsletterMailer.deliver_text_to_email(text, e) }
+  end
+
+  def reschedule_at(current_time, attempts)
+    current_time + 5.seconds
+  end
+end
+```
 
 Hooks
 =====
@@ -313,7 +377,7 @@ create_table :delayed_jobs, :force => true do |table|
 end
 ```
 
-On failure, the job is scheduled again in 5 seconds + N ** 4, where N is the number of retries.
+On error, the job is scheduled again in 5 seconds + N ** 4, where N is the number of attempts or using the job's defined `reschedule_at` method.
 
 The default `Worker.max_attempts` is 25. After this, the job either deleted (default), or left in the database with "failed_at" set.
 With the default of 25 attempts, the last retry will be 20 days later, with the last interval being almost 100 hours.
@@ -332,6 +396,8 @@ By default all jobs will be queued without a named queue. A default named queue 
 
 It is possible to disable delayed jobs for testing purposes. Set `Delayed::Worker.delay_jobs = false` to execute all jobs realtime.
 
+You may need to raise exceptions on SIGTERM signals, `Delayed::Worker.raise_signal_exceptions = :term` will cause the worker to raise a `SignalException` causing the running job to abort and be unlocked, which makes the job available to other workers. The default for this option is false.
+
 Here is an example of changing job parameters in Rails:
 
 ```ruby
@@ -343,6 +409,8 @@ Delayed::Worker.max_run_time = 5.minutes
 Delayed::Worker.read_ahead = 10
 Delayed::Worker.default_queue_name = 'default'
 Delayed::Worker.delay_jobs = !Rails.env.test?
+Delayed::Worker.raise_signal_exceptions = :term
+Delayed::Worker.logger = Logger.new(File.join(Rails.root, 'log', 'delayed_job.log'))
 ```
 
 Cleaning up
